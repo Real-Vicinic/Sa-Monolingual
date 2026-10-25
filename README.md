@@ -1,38 +1,40 @@
 # sa-languages-corpus
 
-Monolingual text pipeline for 10 South African languages. Pulls from every usable public source,
-cleans and sentence-splits, filters by GlotLID, dedupes globally, **excludes anything already in
-`Mehgoss/sa-languages-translation`**, then pushes one config per language to
-`Mehgoss/sa-languages-corpus`.
+[![Dataset](https://img.shields.io/badge/🤗%20dataset-Mehgoss%2Fsa--languages--corpus-yellow)](https://huggingface.co/datasets/Mehgoss/sa-languages-corpus)
 
-Target: 1,000,000 unique sentences per language.
+Monolingual text pipeline for 10 South African languages: Afrikaans, isiNdebele, Sepedi, siSwati,
+Sesotho, Setswana, Xitsonga, Tshivenda, isiXhosa, isiZulu.
 
-## Run locally / on Colab
+It pulls from every usable public source, cleans and sentence-splits, filters by GlotLID, dedupes
+globally, **excludes anything already in `Mehgoss/sa-languages-translation`**, then pushes one config
+per language to `Mehgoss/sa-languages-corpus`. Target: 1,000,000 unique sentences per language.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    S[11 public sources<br/>HF datasets + HTTP] --> F[fetch<br/>resumable, chunked]
+    F --> R[(raw JSONL)]
+    R --> P[process<br/>clean · split · GlotLID · dedupe]
+    X[(parallel corpus<br/>exclusion hashes)] --> P
+    P --> C[(clean JSONL per language)]
+    C --> H[push<br/>HF Hub, one config per language]
+```
+
+Runs two ways from the same code: locally / Colab via `run.py`, or on AWS (Step Functions →
+container-image Lambdas → S3) deployed through GitHub Actions.
+
+## Quick start
 
 ```bash
 pip install -r requirements.txt
 export HF_TOKEN=hf_xxx
 
-python run.py fetch                 # stream raw text -> data/raw/{lang}/{source}.jsonl
-python run.py process               # clean, langid, dedupe -> data/clean/{lang}.jsonl
-python run.py report                # per-language counts vs the 1M target
-python run.py push                  # push configs to Mehgoss/sa-languages-corpus
+python run.py fetch      # stream raw text    -> data/raw/{lang}/{source}.jsonl
+python run.py process    # clean, langid, dedupe -> data/clean/{lang}.jsonl
+python run.py report     # per-language counts vs the 1M target
+python run.py push       # push configs to Mehgoss/sa-languages-corpus
 ```
-
-## Run on AWS
-
-The same fetch/process logic also runs as two container-image Lambdas orchestrated
-by Step Functions, so heavy sources aren't bottlenecked on a Colab session staying
-alive. See **[aws/README-AWS.md](aws/README-AWS.md)** for the full setup and a
-step-by-step first deploy with `sam build` / `sam deploy`.
-
-## CI/CD
-
-`.github/workflows/ci.yml` runs a syntax check and lints `aws/template.yaml` on
-every push/PR, no AWS credentials needed. `.github/workflows/deploy-aws.yml`
-runs `sam build && sam deploy` on push to `main` — set `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY` as repo secrets first (Settings → Secrets and variables
-→ Actions).
 
 Per language / per source:
 
@@ -42,10 +44,8 @@ python run.py fetch --limit 200000        # cap raw docs per source (Colab / pho
 python run.py process --max 1000000       # stop at the target and move on
 ```
 
-Fetch is resumable — completed `lang/source` pairs are marked in `data/state/` and skipped.
-A source that 404s or has no config for a language is logged and skipped, not fatal.
-
-Loading the result:
+Fetch is resumable: completed `lang/source` pairs are marked in `data/state/` and skipped. A source
+that 404s or has no config for a language is logged and skipped, not fatal.
 
 ```python
 from datasets import load_dataset
@@ -54,46 +54,58 @@ zu = load_dataset("Mehgoss/sa-languages-corpus", "zu", split="train")
 
 Schema: `text`, `lang`, `source`.
 
+## Pipeline design
+
+**Cleaning.** NFKC normalization, URL/email stripping, sentence splitting, then length, alphabetic
+and digit-ratio filters, markup/junk detection and a lexical-diversity check.
+
+**Language ID.** GlotLID (`cis-lmu/glotlid`), the only LID model that separates the Nguni languages
+properly. Threshold 0.70 for nr/ss/zu/xh/st/nso/tn (crawl data constantly mislabels isiNdebele and
+siSwati as isiZulu), 0.50 elsewhere. `--skip-langid` bypasses it for quick tests but pollutes the
+low-resource configs.
+
+**Dedup, two layers**, both on a normalized key (NFKC, lowercased, punctuation stripped, whitespace
+collapsed) hashed to 64 bits:
+
+1. Within-corpus, across all sources.
+2. Against `Mehgoss/sa-languages-translation`. Target-side sentences of the parallel corpus are
+   hashed into a sorted uint64 array cached at `data/state/exclude.{lang}.npy` and checked by binary
+   search, so nothing already used in the first training run is repeated.
+
+If the parallel repo's config names aren't `{lang}-en`, pass them to
+`process.build_exclusion(lang, configs=[...])`.
+
 ## Sources
 
 | Source | Type | Langs | Notes |
 |---|---|---|---|
 | MADLAD-400 (clean) | CC crawl | all 10 | Biggest single win. Document-level, audited, deduped. |
-| HPLT v2 cleaned | CC + IA crawl | all 10 | 8T tokens / 193 langs. Non-overlapping with OPUS. |
-| GlotCC-V1 | CC crawl | all 10 | Built specifically for long-tail langs; best nr/ss/ve recall. |
-| CulturaX | CC crawl | af xh zu st tn ts nso | Heavily cleaned mC4+OSCAR. |
-| mC4 | CC crawl | af xh zu st ts nso | Overlaps CulturaX; dedupe handles it. |
-| Glot500-c | mixed | all 10 | Aggregated + deduped, 511 langs. |
-| MzansiText | curated mix | all 10 | UCT corpus behind MzansiLM. Already filtered with DataTrove. |
-| WURA | crawl + news | af zu xh st | mC4 cleaned for African langs + targeted SA news crawls. |
-| Inkuba-Mono | web + news | zu xh | Lelapa, behind InkubaLM. |
-| CC100 | CC crawl | af xh zu st tn nso ss | Small but clean. |
-| OSCAR-2301 | CC crawl | af xh zu st tn nso | Gated — accept terms on HF first. |
+| HPLT v2 cleaned | CC + IA crawl | 8 (no nr, ve) | 193 languages, non-overlapping with OPUS. |
+| GlotCC-V1 | CC crawl | all 10 | Built for long-tail langs; best nr/ss/ve recall. |
+| mC4 | CC crawl | af xh zu st ts nso | Overlap with others handled by dedupe. |
+| Glot500-c | mixed | all 10 | Aggregated + deduped, 511 languages. |
 | Wikipedia | encyclopedic | 9 (no nr) | High quality, low volume. |
 | Vuk'uzenzele | gov magazine | all 10 | DSFSI. Small, very clean, good register. |
-| ZA-gov-multilingual | gov docs | all 10 | DSFSI. |
 | SA-Monolingual-Corpora | gov pubs | zu xh st nso | UCT thesis corpus. |
 | PuoData | curated | tn | Best Setswana resource available. |
+| Emotions corpora (michsethowusu) | curated | all 10 | Per-language HF repos. |
 | Leipzig Corpora | web/news/wiki | all 10 | Pre-split sentences. Only public source with real nr coverage. |
 
-### Not wired up (manual, worth doing)
+Full list and per-language wiring live in `config.py`.
 
-- **NCHLT Text Corpora** (SADiLaR) — all 11 languages, ~9.8M words, the cleanest SA text
-  that exists. DSpace REST at `hdl.handle.net/20.500.12185/1`. Same REST route used for
-  Autshumato on the parallel corpus.
-- **Autshumato monolingual** — af 1.19M segments, xh 341k, zu 239k, nr 83k.
-  Partly already consumed by the parallel corpus; the exclusion step will drop the overlap.
-- **Isolezwe** (isiZulu daily, via Newstools) — largest African-language newspaper archive in SA.
-- **eBible / biblenlp-corpus** — ~31k verses per language, all 10. Formal register but
-  it's real volume for nr, ss, ve.
-- **SABC / SAnews.gov.za / Ligwalagwala FM / Phalaphala FM / Munghana Lonene** — the low-resource
-  languages only get to 1M via targeted news scraping. Nothing public gets ve/ss/nr there.
+### Not wired up yet
+
+- **NCHLT Text Corpora** (SADiLaR): all 11 languages, the cleanest SA text that exists.
+- **Autshumato monolingual**: partly consumed by the parallel corpus; the exclusion step drops overlap.
+- **Isolezwe** (isiZulu daily, via Newstools).
+- **eBible / biblenlp-corpus**: ~31k verses per language, real volume for nr, ss, ve.
+- **SABC / SAnews.gov.za / regional radio sites**: the only route to 1M for ve/ss/nr.
 
 ## Realistic yields
 
-Honest read on the 1M-per-language target from public sources:
+Expected unique sentences from public sources, estimated before a full run:
 
-| Language | Code | Expected unique sentences | 1M target |
+| Language | Code | Expected | 1M target |
 |---|---|---|---|
 | Afrikaans | af | 50M+ | easily |
 | isiZulu | zu | 5–15M | yes |
@@ -102,28 +114,33 @@ Honest read on the 1M-per-language target from public sources:
 | Setswana | tn | 1–3M | yes |
 | Sepedi | nso | 0.8–2M | likely |
 | Xitsonga | ts | 0.4–1.2M | borderline |
-| Tshivenda | ve | 0.3–0.8M | no, needs scraping |
-| siSwati | ss | 0.2–0.6M | no, needs scraping |
-| isiNdebele | nr | 0.1–0.3M | no, needs scraping |
+| Tshivenda | ve | 0.3–0.8M | needs scraping |
+| siSwati | ss | 0.2–0.6M | needs scraping |
+| isiNdebele | nr | 0.1–0.3M | needs scraping |
 
-The four at the bottom are the whole problem. Everything public has already been crawled;
-getting them to 1M means scraping SA broadcast/news sites directly or back-translating.
+The bottom four are the whole problem: everything public is already crawled, so reaching 1M means
+scraping SA broadcast/news sites directly or back-translating.
 
-## Language ID
+## AWS deployment
 
-GlotLID (`cis-lmu/glotlid`) — the only LID model that separates the Nguni languages properly.
-Confidence threshold is 0.70 for nr/ss/zu/xh/st/nso/tn (crawl data mislabels isiNdebele and
-siSwati as isiZulu constantly), 0.50 elsewhere. `--skip-langid` bypasses it for quick tests but
-will pollute the low-resource configs.
+Fetch and process also run as container-image Lambdas orchestrated by Step Functions, so heavy
+sources aren't tied to a Colab session. Setup and first deploy: **[aws/README-AWS.md](aws/README-AWS.md)**.
+Least-privilege deploy permissions are in `deploy-policy.json`.
 
-## Dedup
+## CI/CD
 
-Two layers, both on a normalized key (NFKC, lowercased, punctuation stripped, whitespace collapsed):
+- `ci.yml`: compile check, unit tests (`pytest`), and `sam validate --lint` on every push/PR. No AWS
+  credentials needed.
+- `deploy-aws.yml`: `sam build && sam deploy` on push to `main` (concurrency-guarded, auto-clears
+  wedged CloudFormation stacks, prints the real failure reason on error). Needs `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and `HF_TOKEN` as repo secrets.
 
-1. Within-corpus, across all sources.
-2. Against `Mehgoss/sa-languages-translation` — the target-side sentences of the parallel corpus
-   are hashed into a sorted uint64 array cached in `data/state/exclude.{lang}.npy` and every
-   candidate is checked against it. Nothing already used for the first training run gets repeated.
+## Tests
 
-If the parallel repo's config names aren't `{lang}-en`, pass the right ones into
-`process.build_exclusion(lang, configs=[...])`.
+```bash
+pip install pytest numpy
+pytest -q
+```
+
+Covers normalization, dedup keys, sentence splitting, quality filters, exclusion lookup and the
+Step Functions input builder.
